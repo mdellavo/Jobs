@@ -1,0 +1,10 @@
+* Overview
+
+  a simple webservice to manage a set of running jobs
+
+  PUT /jobs < $task-name > PID/UID
+  POST /jobs/$UID/stdin < data
+  GET /jobs/$UID/std[out|err] > data
+  DELETE /jobs/$UID 
+
+  - add ability to seperate supervisor process from web service?
