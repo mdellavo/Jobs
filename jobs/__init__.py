@@ -3,13 +3,19 @@ from pyramid.config import Configurator
 from pyramid.response import Response
 from pyramid.view import view_config
 
-import logging
 from subprocess import Popen, PIPE
+from datetime import datetime
+import logging
 import fcntl
 import uuid
 import os
 
 log = logging.getLogger('job-server')
+
+def set_nonblocking(f):
+    fd = f.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
 # GET /jobs > status.json
 # PUT /jobs < $task-name > PID/UID
@@ -19,28 +25,85 @@ log = logging.getLogger('job-server')
 
 Jobs = dict()
 
-EXTENSIONS = ('.sh', '.py')
+# FIXME blocking based on query param
+# FIXME waitpid/blocking on kill based on query param
+# FIXME streaming
+# FIXME get for single job
 
-next_job_uid = lambda: str(uuid.uuid4())
-job_path = lambda settings, name: os.path.join(settings['jobs_dir'], name)
-is_job = lambda path: os.path.exists(path) and os.access(path, os.X_OK)
+class Job(object):
 
-def find_job(settings, name):
-    for ext in EXTENSIONS:
-        path = job_path(settings, name + ext)
-        if is_job(path):
-            return path
+    EXTENSIONS = ('.sh', '.py')
 
-def job(uid):
-    j = Jobs[uid]
-    j.poll()
+    def __init__(self, name, path):
+        self.name = name
+        self.path = path
+        self.uid = str(uuid.uuid4())
+        self.started = None
+        self.process = None
 
-    return { 
-        'uid': uid, 
-        'pid': j.pid,
-        'running': j.returncode is None,
-        'returncode': j.returncode 
-    }
+    @classmethod
+    def find_job(cls, name, relative_to):
+        for ext in cls.EXTENSIONS:
+            path = os.path.join(relative_to, name + ext)
+
+            if os.path.exists(path) and os.access(path, os.X_OK):
+                return cls(name, path)
+
+    def start(self):
+        self.started = datetime.now()
+
+        self.process = Popen(
+            self.path, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds=True
+        )
+
+        set_nonblocking(self.process.stdout)
+        set_nonblocking(self.process.stderr)
+
+    def terminate(self):
+        self.process.terminate()
+
+    def kill(self):
+        self.process.kill()
+
+    @property
+    def stdin(self):
+        return self.process.stdin if self.process else None
+
+    @property
+    def stdout(self):
+        return self.process.stdout if self.process else None
+
+    @property
+    def stderr(self):
+        return self.process.stderr if self.process else None
+        
+    @property
+    def pid(self):
+        return self.process.pid if self.process else None
+
+    @property
+    def running(self):
+        if self.process:
+            self.process.poll()
+
+        return self.process and self.process.returncode is None
+
+    @property
+    def return_code(self):
+        # NB triggers poll()
+        if not self.running:
+            return self.process.returncode
+
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'started': self.started.strftime('%Y-%m-%d %H:%M:%S'),
+            'path': self.path,
+            'uid': self.uid, 
+            'pid': self.pid,
+            'running': self.running,
+            'return_code': self.return_code
+       }
 
 response = lambda status, **kwargs: dict(status=status, **kwargs)
 success = lambda **kwargs: response('ok', **kwargs)
@@ -48,36 +111,27 @@ error = lambda msg, **kwargs: response('error', msg=msg, **kwargs)
 
 @view_config(route_name='jobs', renderer='json')
 def status(request):
-    return success(jobs=dict((j, job(j)) for j in Jobs))
-
-def set_nonblocking(f):
-    fd = f.fileno()
-    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    return success(jobs=[job.to_dict() for job in Jobs.values()])
 
 @view_config(route_name='jobs', renderer='json', request_method='PUT')
 def start_job(request):
-    if 'name' not in request.POST:
+    if 'name' not in request.params:
         return error('No job name specified')
 
-    name = request.POST['name']
+    name = request.params['name']
 
     if not name:
         return error('Bad job name')
 
-    path = find_job(request.registry.settings, name)
+    job = Job.find_job(name, request.registry.settings['jobs_dir'])
 
-    if not is_job(path):
+    if not job:
         return error('Unknown job')
-
-    uid = next_job_uid()
-
-    Jobs[uid] = Popen(path, stdin=PIPE, stdout=PIPE, stderr=PIPE, 
-                      close_fds=True)
-    set_nonblocking(Jobs[uid].stdout)
-    set_nonblocking(Jobs[uid].stderr)
     
-    return success(uid=uid, name=name)
+    job.start()
+    Jobs[job.uid] = job
+
+    return success(job=job.to_dict())
 
 def validate_job_uid(func):
     def _validate_job_uid(request):
@@ -90,36 +144,39 @@ def validate_job_uid(func):
         if uid not in Jobs:
             return error('Unknown UID')
 
-        return func(request, uid, Jobs[uid])
+        return func(request, Jobs[uid])
 
     return _validate_job_uid
 
 @view_config(route_name='job', renderer='json', request_method='DELETE')
 @validate_job_uid
-def stop_job(request, uid, job):
-    if request.POST.get('kill') == '1':
+def stop_job(request, job):
+    if request.params.get('kill') == '1':
         job.kill()
     else:
         job.terminate()
 
-    return success()
+    return success(job=job.to_dict())
 
-def read_from_job(request, uid, job, f, key):
-    return success(**{key: f.read()})
+def read_from_job(request, job, f, key):
+    try:
+        return success(**{key: f.read()})
+    except IOError, e:
+        return error(str(e))
 
 @view_config(route_name='job-stdout', renderer='json', request_method='GET')
 @validate_job_uid
-def read_from_stdout(request, uid, job):
-    return read_from_job(request, uid, job, job.stdout, 'stdout')
+def read_from_stdout(request, job):
+    return read_from_job(request, job, job.stdout, 'stdout')
 
 @view_config(route_name='job-stderr', renderer='json', request_method='GET')
 @validate_job_uid
-def read_from_stdout(request, uid, job):
-    return read_from_job(request, uid, job, job.stderr, 'stderr')
+def read_from_stder(request, job):
+    return read_from_job(request, job, job.stderr, 'stderr')
 
 @view_config(route_name='job', renderer='json', request_method='POST')
 @validate_job_uid
-def write_to_job(request, uid, job):
+def write_to_job(request, job):
     return None
 
 def main(global_config, **settings):
