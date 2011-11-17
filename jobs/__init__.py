@@ -1,9 +1,12 @@
+from gevent import monkey; monkey.patch_socket()
+from gevent.pywsgi import WSGIServer 
+
 from paste.httpserver import serve
 from pyramid.config import Configurator
 from pyramid.response import Response
 from pyramid.view import view_config
 
-from subprocess import Popen, PIPE
+from jobs.subprocess import Popen, PIPE
 from datetime import datetime
 import logging
 import fcntl
@@ -29,6 +32,10 @@ Jobs = dict()
 # FIXME waitpid/blocking on kill based on query param
 # FIXME streaming
 # FIXME get for single job
+# FIXME poll for job exit
+# FIXME callback
+# FIXME retstartable ?
+# FIXME arguments to job
 
 class Job(object):
 
@@ -56,8 +63,8 @@ class Job(object):
             self.path, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds=True
         )
 
-        set_nonblocking(self.process.stdout)
-        set_nonblocking(self.process.stderr)
+        #set_nonblocking(self.process.stdout)
+        #set_nonblocking(self.process.stderr)
 
     def terminate(self):
         self.process.terminate()
@@ -83,18 +90,22 @@ class Job(object):
 
     @property
     def running(self):
-        if self.process:
-            self.process.poll()
-
         return self.process and self.process.returncode is None
 
     @property
     def return_code(self):
-        # NB triggers poll()
-        if not self.running:
-            return self.process.returncode
+        return self.process.returncode
+
+    def poll(self):
+        if self.process:
+            self.process.poll()
+    
+    def wait(self):
+        if self.process:
+            self.process.wait()
 
     def to_dict(self):
+        self.poll()
         return {
             'name': self.name,
             'started': self.started.strftime('%Y-%m-%d %H:%M:%S'),
@@ -151,17 +162,20 @@ def validate_job_uid(func):
 @view_config(route_name='job', renderer='json', request_method='DELETE')
 @validate_job_uid
 def stop_job(request, job):
-    if request.params.get('kill') == '1':
+    if 'kill' in request.params:
         job.kill()
     else:
         job.terminate()
+
+    if 'wait' in request.params:
+        job.wait()
 
     return success(job=job.to_dict())
 
 def read_from_job(request, job, f, key):
     try:
-        return success(**{key: f.read()})
-    except IOError, e:
+        return success(**{key: os.read(f.fileno(), 8192) })
+    except OSError, e:
         return error(str(e))
 
 @view_config(route_name='job-stdout', renderer='json', request_method='GET')
@@ -174,19 +188,29 @@ def read_from_stdout(request, job):
 def read_from_stder(request, job):
     return read_from_job(request, job, job.stderr, 'stderr')
 
-@view_config(route_name='job', renderer='json', request_method='POST')
+@view_config(route_name='job-stdin', renderer='json', request_method='POST')
 @validate_job_uid
 def write_to_job(request, job):
-    return None
+    if 'data' not in request.params:
+        return error('No data specified')
+
+    data = request.params['data']
+
+    bytes = os.write(job.stdin.fileno(), (data))
+
+    return success(bytes=bytes)
 
 def main(global_config, **settings):
-
     config = Configurator(settings=settings)
     config.add_route('jobs', '/jobs')
     config.add_route('job', '/jobs/{uid}')
     config.add_route('job-stdout', '/jobs/{uid}/stdout')
     config.add_route('job-stderr', '/jobs/{uid}/stderr')
+    config.add_route('job-stdin', '/jobs/{uid}/stdin')
 
     config.scan()
 
     return config.make_wsgi_app()
+
+def server_runner(app, global_conf, host, port, spawn='default', **kwargs): 
+    WSGIServer((host, int(port)), app).serve_forever()

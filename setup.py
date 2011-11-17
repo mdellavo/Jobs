@@ -31,6 +31,9 @@ setup(name='jobs',
       entry_points = """\
       [paste.app_factory]
       main = jobs:main
+
+      [paste.server_runner]
+      gevent_runner = jobs:server_runner
       """,
       paster_plugins=['pyramid'],
       )

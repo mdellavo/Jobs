@@ -1,2 +1,4 @@
 pyramid
 pyramid_debugtoolbar
+gevent
+pastegevent
