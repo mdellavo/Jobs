@@ -1,5 +1,6 @@
 from gevent import monkey; monkey.patch_socket()
 from gevent.pywsgi import WSGIServer 
+from gevent import socket, spawn, sleep
 
 from paste.httpserver import serve
 from pyramid.config import Configurator
@@ -15,11 +16,6 @@ import os
 
 log = logging.getLogger('job-server')
 
-def set_nonblocking(f):
-    fd = f.fileno()
-    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
 # GET /jobs > status.json
 # PUT /jobs < $task-name > PID/UID
 # POST /jobs/$UID/stdin < data
@@ -28,11 +24,19 @@ def set_nonblocking(f):
 
 Jobs = dict()
 
-# FIXME blocking based on query param
-# FIXME waitpid/blocking on kill based on query param
+# FIXME flush query param to make sure whole data is feed in stdin
 # FIXME streaming
+# FIXME communicate() 
 # FIXME get for single job
-# FIXME poll for job exit
+
+# FIXME interface
+
+# FIXME job status dir
+# FIXME detach jobs from server
+
+# FIXME poller to cache stats
+# FIXME logger to log output
+
 # FIXME callback
 # FIXME retstartable ?
 # FIXME arguments to job
@@ -46,6 +50,7 @@ class Job(object):
         self.path = path
         self.uid = str(uuid.uuid4())
         self.started = None
+        self.ended = None
         self.process = None
 
     @classmethod
@@ -57,14 +62,23 @@ class Job(object):
                 return cls(name, path)
 
     def start(self):
-        self.started = datetime.now()
 
-        self.process = Popen(
-            self.path, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds=True
-        )
+        def poller():
+            self.process = Popen(
+                self.path, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds=True
+            )
 
-        #set_nonblocking(self.process.stdout)
-        #set_nonblocking(self.process.stderr)
+            self.poll()
+
+            self.started = datetime.now()
+
+            while self.running:
+                sleep(1)
+                self.poll()
+                
+            self.ended = datetime.now()
+
+        spawn(poller)
 
     def terminate(self):
         self.process.terminate()
@@ -94,7 +108,7 @@ class Job(object):
 
     @property
     def return_code(self):
-        return self.process.returncode
+        return self.process.returncode if self.process else None
 
     def poll(self):
         if self.process:
@@ -105,16 +119,19 @@ class Job(object):
             self.process.wait()
 
     def to_dict(self):
-        self.poll()
+
+        fmt_dt = lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if x else None
+
         return {
             'name': self.name,
-            'started': self.started.strftime('%Y-%m-%d %H:%M:%S'),
+            'started': fmt_dt(self.started),
+            'ended': fmt_dt(self.ended),
             'path': self.path,
             'uid': self.uid, 
             'pid': self.pid,
             'running': self.running,
             'return_code': self.return_code
-       }
+        }
 
 response = lambda status, **kwargs: dict(status=status, **kwargs)
 success = lambda **kwargs: response('ok', **kwargs)
@@ -174,9 +191,14 @@ def stop_job(request, job):
 
 def read_from_job(request, job, f, key):
     try:
-        return success(**{key: os.read(f.fileno(), 8192) })
+        if 'wait' in request.params:
+            socket.wait_read(f.fileno())
+
+        data = os.read(f.fileno(), 8192)
     except OSError, e:
-        return error(str(e))
+        data = None
+        
+    return success(**{key: data})
 
 @view_config(route_name='job-stdout', renderer='json', request_method='GET')
 @validate_job_uid
@@ -195,6 +217,9 @@ def write_to_job(request, job):
         return error('No data specified')
 
     data = request.params['data']
+
+    if 'wait' in requet.params:
+        socket.wait_write(job.stdin.fileno())
 
     bytes = os.write(job.stdin.fileno(), (data))
 

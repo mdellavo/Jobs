@@ -1,6 +1,10 @@
 #!/bin/bash
 
-while true; do
-date
-sleep 5
+x=1
+while [ $x -le 10 ]
+do
+    date
+    sleep 1
+    x=$(( $x + 1 ))
 done
+
