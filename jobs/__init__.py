@@ -1,6 +1,7 @@
 from gevent import monkey; monkey.patch_socket()
 from gevent.pywsgi import WSGIServer 
 from gevent import socket, spawn, sleep
+from gevent.queue import Queue
 
 from paste.httpserver import serve
 from pyramid.config import Configurator
@@ -12,6 +13,7 @@ from datetime import datetime
 import logging
 import fcntl
 import uuid
+import json
 import os
 
 log = logging.getLogger('job-server')
@@ -24,18 +26,15 @@ log = logging.getLogger('job-server')
 
 Jobs = dict()
 
-# FIXME flush query param to make sure whole data is feed in stdin
 # FIXME streaming
 # FIXME communicate() 
-# FIXME get for single job
+# FIXME top-like stats
 
-# FIXME interface
+# FIXME ui
 
-# FIXME job status dir
 # FIXME detach jobs from server
 
-# FIXME poller to cache stats
-# FIXME logger to log output
+# FIXME set logger to run dir
 
 # FIXME callback
 # FIXME retstartable ?
@@ -45,40 +44,84 @@ class Job(object):
 
     EXTENSIONS = ('.sh', '.py')
 
-    def __init__(self, name, path):
+    def __init__(self, name, path, run_path):
         self.name = name
         self.path = path
         self.uid = str(uuid.uuid4())
         self.started = None
         self.ended = None
+        self.last_poll = None
         self.process = None
 
+        self.stdin = Queue()
+        self.stdout = Queue()
+        self.stderr = Queue()
+
+        self.run_path = os.path.join(run_path, self.uid)
+        os.makedirs(self.run_path)
+
     @classmethod
-    def find_job(cls, name, relative_to):
+    def find_job(cls, name, relative_to, run_dir):
         for ext in cls.EXTENSIONS:
             path = os.path.join(relative_to, name + ext)
 
             if os.path.exists(path) and os.access(path, os.X_OK):
-                return cls(name, path)
+                return cls(name, path, run_dir)
 
-    def start(self):
+    def poller(self):
+        self.process = Popen(
+            self.path, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds=True
+        )
 
-        def poller():
-            self.process = Popen(
-                self.path, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds=True
-            )
+        self.poll()        
+        self.started = datetime.now()
 
+        spawn(self.reader, self.process.stdout, self.stdout, 'stdout')
+        spawn(self.reader, self.process.stderr, self.stderr, 'stderr')
+        spawn(self.writer, self.process.stdin, self.stdin)
+
+        def log_status():
+            with open(os.path.join(self.run_path, 'status'), 'w') as out:
+                out.write(json.dumps(self.to_dict()))
+        
+        while self.running:
+            sleep(1)
             self.poll()
+            self.last_poll = datetime.now()
+            log_status()
 
-            self.started = datetime.now()
+        self.ended = datetime.now()
 
-            while self.running:
-                sleep(1)
-                self.poll()
-                
-            self.ended = datetime.now()
+        log_status()
 
-        spawn(poller)
+    def reader(self, f, queue, key):
+        fd = f.fileno()
+
+        while self.running:
+            try:
+                socket.wait_read(fd)
+                data = os.read(fd, 8192)
+
+                with open(os.path.join(self.run_path, key), 'a') as out:
+                    out.write(data)
+                    
+                queue.put(data)
+            except OSError, e:
+                break
+        
+    def writer(self, f, queue):
+        fd = f.fileno()
+
+        while self.running:
+            data = queue.get()
+
+            total = len(data)
+            while total > 0:
+                socket.wait_write(fd)
+                total -= os.write(fd, data)
+                            
+    def start(self):
+        spawn(self.poller)
 
     def terminate(self):
         self.process.terminate()
@@ -86,18 +129,6 @@ class Job(object):
     def kill(self):
         self.process.kill()
 
-    @property
-    def stdin(self):
-        return self.process.stdin if self.process else None
-
-    @property
-    def stdout(self):
-        return self.process.stdout if self.process else None
-
-    @property
-    def stderr(self):
-        return self.process.stderr if self.process else None
-        
     @property
     def pid(self):
         return self.process.pid if self.process else None
@@ -126,6 +157,7 @@ class Job(object):
             'name': self.name,
             'started': fmt_dt(self.started),
             'ended': fmt_dt(self.ended),
+            'last_poll': fmt_dt(self.last_poll),
             'path': self.path,
             'uid': self.uid, 
             'pid': self.pid,
@@ -151,7 +183,9 @@ def start_job(request):
     if not name:
         return error('Bad job name')
 
-    job = Job.find_job(name, request.registry.settings['jobs_dir'])
+    job = Job.find_job(name,
+                       request.registry.settings['jobs_dir'], 
+                       request.registry.settings['run_dir'])
 
     if not job:
         return error('Unknown job')
@@ -176,6 +210,11 @@ def validate_job_uid(func):
 
     return _validate_job_uid
 
+@view_config(route_name='job', renderer='json')
+@validate_job_uid
+def job_status(request, job):
+    return success(job=job.to_dict())
+
 @view_config(route_name='job', renderer='json', request_method='DELETE')
 @validate_job_uid
 def stop_job(request, job):
@@ -189,16 +228,17 @@ def stop_job(request, job):
 
     return success(job=job.to_dict())
 
-def read_from_job(request, job, f, key):
-    try:
-        if 'wait' in request.params:
-            socket.wait_read(f.fileno())
+def read_from_job(request, job, queue, key):
+    block = 'wait' in request.params
 
-        data = os.read(f.fileno(), 8192)
-    except OSError, e:
-        data = None
-        
-    return success(**{key: data})
+    if not self.running and queue.qsize == 0:
+        return error('No more data')
+
+    data = []
+    while queue.qsize() > 0:
+        data.append(queue.get(block))
+
+    return success(**{key: ''.join(data)})
 
 @view_config(route_name='job-stdout', renderer='json', request_method='GET')
 @validate_job_uid
@@ -213,17 +253,17 @@ def read_from_stder(request, job):
 @view_config(route_name='job-stdin', renderer='json', request_method='POST')
 @validate_job_uid
 def write_to_job(request, job):
+
+    if not self.running:
+        return error('Job has ended')
+
     if 'data' not in request.params:
         return error('No data specified')
 
     data = request.params['data']
-
-    if 'wait' in requet.params:
-        socket.wait_write(job.stdin.fileno())
-
-    bytes = os.write(job.stdin.fileno(), (data))
-
-    return success(bytes=bytes)
+    block = 'wait' in requet.params
+    job.stdin.put(data, block)
+    return success()
 
 def main(global_config, **settings):
     config = Configurator(settings=settings)
