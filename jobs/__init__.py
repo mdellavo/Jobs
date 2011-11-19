@@ -80,19 +80,13 @@ class Job(object):
         spawn(self.reader, self.process.stderr, self.stderr, 'stderr')
         spawn(self.writer, self.process.stdin, self.stdin)
 
-        def log_status():
-            with open(os.path.join(self.run_path, 'status'), 'w') as out:
-                out.write(json.dumps(self.to_dict()))
-        
         while self.running:
             sleep(1)
             self.poll()
-            self.last_poll = datetime.now()
-            log_status()
 
         self.ended = datetime.now()
 
-        log_status()
+        self.poll()
 
     def reader(self, f, queue, key):
         fd = f.fileno()
@@ -144,6 +138,12 @@ class Job(object):
     def poll(self):
         if self.process:
             self.process.poll()
+
+            with open(os.path.join(self.run_path, 'status'), 'w') as out:
+                out.write(json.dumps(self.to_dict()))
+        
+
+            self.last_poll = datetime.now()
     
     def wait(self):
         if self.process:
