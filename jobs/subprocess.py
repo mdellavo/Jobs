@@ -7,6 +7,9 @@ _subprocess = __import__('subprocess')
 
 from gevent import socket, select, hub
 
+import logging
+log = logging.getLogger(__name__)
+
 # identical to original
 CalledProcessError = _subprocess.CalledProcessError
 MAXFD = _subprocess.MAXFD
