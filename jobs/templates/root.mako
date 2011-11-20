@@ -32,18 +32,19 @@
         <form id="start-job" method="PUT" action="/jobs">
           <input type="text" name="name" />
           <button type="submit">
+            <img src="/static/img/icons/add.png"/>
             <span>Start</span>
           </button>
         </form>      
       </fieldset>
-
-
         
       <div class="header">
-        <div class="span-11">Name</div>
+        <div class="span-2">Name</div>
+        <div class="span-7">UID</div>
         <div class="span-2">Running</div>
         <div class="span-4">Started</div>
         <div class="span-4">Ended</div>
+        <div class="span-2">Exit Code</div>
         <div class="span-3 last">Actions</div>
       </div>
       <div id="jobs">
@@ -54,14 +55,25 @@
     <%text>
     <script type="text/tiger" id="job">
       <div class="job clear" id="${job.uid}">
-        <div class="span-11">
-          ${job.name}<br/>
-          <span class="quiet">${job.uid}</span>
+        <div class="span-2">
+          ${job.name}
+        </div>
+        <div class="span-7">
+          ${job.uid}
         </div>
         <div class="span-2">${job.running ? 'Yes' : 'No'}</div>
         <div class="span-4">${job.started}</div>         
         <div class="span-4">${job.ended ? job.ended : '-'}</div>
-        <div class="span-3 last"></div>
+        <div class="span-2">${job.return_code !== null ? '' + job.return_code : '-'}</div>
+        <div class="span-3 last">
+          
+          %if(job.running)
+          <form class="stop-job" method="DELETE" action="/jobs/${job.uid}">
+            <input type="image" src="/static/img/icons/delete.png"/>
+          </form>      
+          %endif
+
+        </div>
       </div>
     </script>
     </%text>

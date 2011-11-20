@@ -28,11 +28,33 @@ $(document).ready(function() {
     $('#start-job').submit(function() {
         $.ajax({
             url: this.action,
-            type: 'PUT',
+            type: this.method,
             context: this,
             data: $(this).serialize(),
             dataType: 'json',
             success: function(obj) {
+                add_job(obj.job);
+            },
+            error: function() {
+                window.alert('Error!')
+            }
+        });
+
+        return false;
+    });
+
+
+    $('.stop-job input').live('click', function() {
+        var form = this.form;
+        
+        $.ajax({
+            url: form.action,
+            type: form.method,
+            context: form,
+            data: $(form).serialize(),
+            dataType: 'json',
+            success: function(obj) {
+                $('#' + obj.job.uid).remove();
                 add_job(obj.job);
             },
             error: function() {
